@@ -1,23 +1,24 @@
-     <!doctype html>
+  <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Circadian BLE Dashboard — Stable</title>
+<title>Human Circadian Health Monitor — Safe BLE Dashboard</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
-  :root{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+  :root{font-family:Inter,system-ui,-apple-system,'Segoe UI',Roboto,Arial;}
   body{margin:0;padding:20px;background:#f4fbff;color:#0b1220}
   header{display:flex;align-items:center;gap:12px}
-  h1{font-size:18px;margin:0}
+  h1{font-size:20px;margin:0}
   #status{margin-left:auto;font-size:13px;color:#42637a}
   .controls{margin-top:14px;display:flex;gap:8px;align-items:center}
   button,select{padding:8px 12px;border-radius:8px;border:none;background:#0b69ff;color:#fff;cursor:pointer}
   button.secondary{background:#2d9bd6}
-  #main{display:grid;grid-template-columns:1fr 320px;gap:18px;margin-top:14px}
+  #main{display:grid;grid-template-columns:1fr 340px;gap:18px;margin-top:14px}
   .card{background:#fff;padding:12px;border-radius:10px;box-shadow:0 8px 20px rgba(10,60,120,0.06)}
-  .chart-wrap{height:340px;overflow:hidden}
-  canvas{width:100% !important;height:340px !important;display:block}
+  .chart-wrap{height:360px;overflow:hidden}
+  canvas{width:100% !important;height:360px !important;display:block}
   .metrics div{margin-bottom:6px;font-size:14px}
   .alerts .alert{padding:8px;border-radius:8px;margin-top:8px}
   .alert.ok{background:#e6f9ee;color:#047a3f}
@@ -26,14 +27,306 @@
   #errors{position:fixed;right:12px;bottom:12px;max-width:360px;z-index:9999}
   .err{background:#fff2f2;border:1px solid #ffb3b3;padding:8px;border-radius:8px;margin-top:6px;color:#7a1414}
   small{color:#57788f}
+  footer{margin-top:14px;color:#6a8aa4}
 </style>
 </head>
 <body>
   <header>
     <h1>Human Circadian Health Monitor</h1>
-    <div id="status">Ready</div>
+    <div id="status">Ready — click Connect</div>
   </header>
 
   <div class="controls">
     <button id="connectBtn">Connect to Device</button>
-    <button id="disconnectBtn" class="secondary" disabled>Disconnect</b
+    <button id="disconnectBtn" class="secondary" disabled>Disconnect</button>
+    <select id="mode">
+      <option value="service">Filter: Service</option>
+      <option value="all">Fallback: Show All</option>
+    </select>
+    <button id="demoBtn" class="secondary">Generate Demo</button>
+    <button id="exportBtn" class="secondary">Export Chart PNG</button>
+  </div>
+
+  <div id="main">
+    <div class="card">
+      <label style="font-weight:600">Live Charts</label>
+      <div class="chart-wrap" style="margin-top:10px">
+        <canvas id="mainChart"></canvas>
+      </div>
+
+      <div style="display:flex;gap:12px;margin-top:12px">
+        <div class="card" style="flex:1;padding:10px">
+          <label style="font-weight:600">Current Readings</label>
+          <div class="metrics" id="metrics" style="margin-top:8px">
+            <div>Device: <b id="devName">—</b></div>
+            <div>Brightness (C): <b id="curC">—</b></div>
+            <div>Blue Ratio: <b id="curBlue">—</b></div>
+            <div>Activity (mag): <b id="curAct">—</b></div>
+            <div>State: <b id="curState">—</b></div>
+          </div>
+        </div>
+
+        <div class="card" style="width:220px;padding:10px">
+          <label style="font-weight:600">Circadian Alerts</label>
+          <div id="alerts"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <label style="font-weight:600">Summary</label>
+      <div style="margin-top:10px">
+        <div>Records: <span id="recCount">0</span></div>
+        <div>Avg Activity: <span id="avgAct">—</span></div>
+        <div>Avg Brightness: <span id="avgC">—</span></div>
+        <div style="margin-top:10px"><b>Circadian Score:</b> <span id="circScore">—</span></div>
+      </div>
+
+      <hr style="margin:12px 0">
+
+      <small>Tip: close nRF Connect and other BLE apps before connecting. Use Chrome/Edge and open via HTTPS or localhost.</small>
+    </div>
+  </div>
+
+  <div id="errors"></div>
+  <footer>Demo-ready dashboard — use Generate Demo if BLE isn't available.</footer>
+
+<script>
+(() => {
+  'use strict';
+  // --- UUIDs
+  const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+  const ACCEL_UUID   = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+  const RGB_UUID     = 'beb5483e-36e1-4688-b7f5-ea07361b26b0';
+
+  // thresholds & limits
+  const MAX_RECORDS = 120;
+  const CHART_THROTTLE_MS = 250; // 4 updates/sec
+  const BRIGHTNESS_THRESHOLD = 200;
+  const BLUE_RATIO_NIGHT = 0.35;
+  const NIGHT_START = 19, NIGHT_END = 23;
+  const STILL_THRESHOLD = 0.15, ACTIVE_THRESHOLD = 1.2;
+
+  // state
+  let device=null, server=null, accelChar=null, rgbChar=null;
+  let lastAccel=null, lastRGB=null;
+  let records = [], chartDirty=false, lastChartUpdate=0;
+
+  // DOM helpers
+  const $ = id => document.getElementById(id);
+  const setStatus = s => { const el=$('status'); if(el) el.innerText = s; };
+  const pushErr = t => { const box=$('errors'); const el=document.createElement('div'); el.className='err'; el.innerText=t; box.prepend(el); setTimeout(()=>el.remove(),20000); };
+
+  // chart (category x-axis to avoid date adapter)
+  const ctx = $('mainChart').getContext('2d');
+  const chart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [
+      {label:'Activity (g)', data: [], borderColor:'#ff6384', tension:0.3, pointRadius:2},
+      {label:'Brightness (C)', data: [], borderColor:'#36a2eb', tension:0.3, pointRadius:2},
+      {label:'Blue Ratio', data: [], borderColor:'#ffcd56', tension:0.3, pointRadius:2}
+    ]},
+    options: {
+      animation:false, responsive:true, maintainAspectRatio:false,
+      scales: { x: { type:'category', ticks:{maxRotation:0,autoSkip:true,maxTicksLimit:20} }, y: {} },
+      plugins: { legend: { position: 'top' } }
+    }
+  });
+
+  // metrics & alert helpers
+  function updateMetricsUi(){
+    const last = records.length ? records[records.length-1] : null;
+    $('recCount').innerText = records.length;
+    $('avgAct').innerText = (records.reduce((s,r)=>s+(r.activity||0),0)/Math.max(1,records.length)).toFixed(2);
+    $('avgC').innerText = Math.round(records.reduce((s,r)=>s+(r.c||0),0)/Math.max(1,records.length));
+    $('curAct').innerText = last ? (last.activity||0).toFixed(2) : '—';
+    $('curC').innerText = last ? (last.c||'—') : '—';
+    $('curBlue').innerText = last ? (last.blueRatio||0).toFixed(2) : '—';
+    $('curState').innerText = last ? last.state : '—';
+
+    if(last){
+      let score = 50;
+      if((last.c||0) > BRIGHTNESS_THRESHOLD) score += 20;
+      if((last.activity||0) > STILL_THRESHOLD) score += 20;
+      if((last.blueRatio||0) > BLUE_RATIO_NIGHT && (new Date()).getHours() >= NIGHT_START) score -= 30;
+      score = Math.max(0,Math.min(100,score));
+      $('circScore').innerText = score + '/100';
+    }
+  }
+
+  function pushAlert(text, level='warn'){
+    const box = $('alerts'); if(!box) return;
+    const el = document.createElement('div'); el.className = 'alert ' + (level||'warn'); el.innerText = text;
+    box.prepend(el); while(box.children.length>4) box.removeChild(box.lastChild);
+  }
+
+  // data handling
+  function addRecord(rec){
+    records.push(rec);
+    if(records.length > MAX_RECORDS) records.shift();
+    chartDirty = true;
+    updateMetricsUi();
+    evaluateAlerts(rec);
+  }
+
+  function evaluateAlerts(rec){
+    try{
+      const h = rec.t.getHours();
+      if(h >= NIGHT_START && h <= NIGHT_END && rec.blueRatio > BLUE_RATIO_NIGHT){
+        pushAlert('High Blue Light at Night — reduce screen exposure', 'bad');
+      }
+      if(h >= 6 && h <= 10 && (rec.c || 0) < BRIGHTNESS_THRESHOLD){
+        pushAlert('Low Morning Light — step outside or use bright warm light', 'warn');
+      }
+      if(h >= 9 && h <= 17 && (rec.activity || 0) < STILL_THRESHOLD){
+        pushAlert('Low daytime activity — possible drowsiness', 'warn');
+      }
+      if(h >= 0 && h <= 6){
+        const arr = records.slice(-12).map(r=>r.activity || 0);
+        const spikes = arr.filter(v=>v > ACTIVE_THRESHOLD).length;
+        if(spikes >= 2) pushAlert('Restless movement detected during night — possible sleep disturbance', 'bad');
+        const stills = arr.filter(v=>v < STILL_THRESHOLD).length;
+        if(stills >= 10 && records.length > 20) pushAlert('Consistent night stillness detected — sleep pattern OK', 'ok');
+      }
+    }catch(e){}
+  }
+
+  // throttle chart updates
+  function maybeUpdateChart(){
+    if(!chartDirty) return;
+    const now = Date.now();
+    if(now - lastChartUpdate < CHART_THROTTLE_MS) return;
+    lastChartUpdate = now; chartDirty = false;
+    chart.data.labels = records.map(r => r.label);
+    chart.data.datasets[0].data = records.map(r => r.activity);
+    chart.data.datasets[1].data = records.map(r => r.c);
+    chart.data.datasets[2].data = records.map(r => r.blueRatio);
+    chart.update('none');
+  }
+  setInterval(maybeUpdateChart, CHART_THROTTLE_MS);
+
+  // utils
+  function parseCSV(s){ if(typeof s !== 'string') return []; return s.trim().split(',').map(x => Number(x)); }
+  function mag(x,y,z){ return Math.sqrt((x||0)*(x||0)+(y||0)*(y||0)+(z||0)*(z||0)); }
+  function timeLabel(d){ return d.toTimeString().slice(0,8); }
+
+  // BLE handlers
+  async function connectFlow(){
+    try{
+      if(!('bluetooth' in navigator)){ pushErr('Web Bluetooth not available in this browser. Use Chrome/Edge or localhost/HTTPS'); setStatus('No Web Bluetooth'); return; }
+
+      setStatus('Requesting device (service-filter)...');
+      try {
+        device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [SERVICE_UUID] }],
+          optionalServices: [SERVICE_UUID]
+        });
+      } catch(e) {
+        setStatus('Falling back to acceptAllDevices (pick device)');
+        device = await navigator.bluetooth.requestDevice({
+          acceptAllDevices: true,
+          optionalServices: [SERVICE_UUID]
+        });
+      }
+
+      if(!device){ setStatus('No device selected'); return; }
+      $('devName').innerText = device.name || device.id || 'Unknown';
+      setStatus('Connecting to device...');
+      device.addEventListener('gattserverdisconnected', () => {
+        setStatus('Device disconnected');
+        $('connectBtn').disabled = false; $('disconnectBtn').disabled = true;
+        pushAlert('Device disconnected', 'warn');
+      });
+      server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+
+      accelChar = await service.getCharacteristic(ACCEL_UUID);
+      rgbChar   = await service.getCharacteristic(RGB_UUID);
+
+      await accelChar.startNotifications();
+      accelChar.addEventListener('characteristicvaluechanged', (ev) => {
+        try{
+          const str = new TextDecoder().decode(ev.target.value);
+          lastAccel = parseCSV(str);
+          if(lastAccel && lastRGB){
+            const t = new Date();
+            const activity = mag(lastAccel[0], lastAccel[1], lastAccel[2]);
+            const r = lastRGB[0]||0, g = lastRGB[1]||0, b = lastRGB[2]||0, c = lastRGB[3]||0;
+            const sum = (r+g+b) || 1; const blueRatio = b / sum;
+            const state = (activity < STILL_THRESHOLD) ? 'Still' : (activity > ACTIVE_THRESHOLD ? 'Active' : 'Normal');
+            addRecord({ t, label: timeLabel(t), activity, r,g,b,c, blueRatio, state });
+            lastAccel = lastRGB = null;
+          }
+        }catch(err){ pushErr('Accel parse error'); }
+      });
+
+      await rgbChar.startNotifications();
+      rgbChar.addEventListener('characteristicvaluechanged', (ev) => {
+        try{
+          const str = new TextDecoder().decode(ev.target.value);
+          lastRGB = parseCSV(str);
+          if(lastAccel && lastRGB){
+            const t = new Date();
+            const activity = mag(lastAccel[0], lastAccel[1], lastAccel[2]);
+            const r = lastRGB[0]||0, g = lastRGB[1]||0, b = lastRGB[2]||0, c = lastRGB[3]||0;
+            const sum = (r+g+b) || 1; const blueRatio = b / sum;
+            const state = (activity < STILL_THRESHOLD) ? 'Still' : (activity > ACTIVE_THRESHOLD ? 'Active' : 'Normal');
+            addRecord({ t, label: timeLabel(t), activity, r,g,b,c, blueRatio, state });
+            lastAccel = lastRGB = null;
+          }
+        }catch(err){ pushErr('RGB parse error'); }
+      });
+
+      setStatus('Connected: ' + (device.name || device.id));
+      $('connectBtn').disabled = true; $('disconnectBtn').disabled = false;
+      pushAlert('Connected and listening for data', 'ok');
+    }catch(err){
+      report(err);
+      setStatus('Connect failed');
+      $('connectBtn').disabled = false; $('disconnectBtn').disabled = true;
+    }
+  }
+
+  function disconnectFlow(){
+    try{
+      if(device && device.gatt && device.gatt.connected) device.gatt.disconnect();
+      setStatus('Disconnected');
+    }catch(e){ pushErr('Disconnect failed'); }
+  }
+
+  // demo generator
+  function generateDemo(){
+    records = [];
+    for(let i=0;i<40;i++){
+      const t = new Date(Date.now() - (40-i)*1000);
+      const ax = (Math.random()-0.5)*0.4, ay=(Math.random()-0.5)*0.4, az=1+(Math.random()-0.5)*0.05;
+      const r = Math.round(100 + Math.random()*200), g = Math.round(80 + Math.random()*150), b = Math.round(80 + Math.random()*250);
+      const c = r + g + b;
+      const activity = mag(ax,ay,az);
+      const blueRatio = (r+g+b)?(b/(r+g+b)):0;
+      addRecord({ t, label: timeLabel(t), activity, r,g,b,c, blueRatio, state: activity < STILL_THRESHOLD ? 'Still' : 'Normal' });
+    }
+    setStatus('Demo generated');
+  }
+
+  // report helper
+  function report(e){ console.error(e); pushErr('Error: ' + (e && e.message ? e.message : String(e))); }
+
+  // UI wiring
+  $('connectBtn').addEventListener('click', () => { $('connectBtn').disabled=true; connectFlow(); });
+  $('disconnectBtn').addEventListener('click', disconnectFlow);
+  $('demoBtn').addEventListener('click', generateDemo);
+  $('exportBtn').addEventListener('click', () => {
+    try{
+      const url = $('mainChart').toDataURL('image/png');
+      const a = document.createElement('a'); a.href = url; a.download = 'circadian.png'; a.click();
+    }catch(e){ report(e); }
+  });
+
+  // initial availability check
+  if(!('bluetooth' in navigator)) pushErr('Web Bluetooth not available. Use Chrome/Edge / localhost or GitHub Pages (HTTPS).');
+
+})();
+</script>
+</body>
+</html>
