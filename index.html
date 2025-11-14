@@ -1,99 +1,119 @@
-  /*
-  Robust BLE broadcaster for ESP32
-  - Advertises service UUID and exposes two notify characteristics:
-    ACCEL_CHAR_UUID -> "ax,ay,az"
-    RGB_CHAR_UUID   -> "r,g,b,c"
-  - If sensors fail, it will still advertise and send demo values so the web page can connect.
-  - Upload, then open Serial Monitor at 115200 for debug logs.
-*/
+ <!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>BLE Graph – Stable</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  body { font-family: Arial; padding: 20px; background:#f0f8ff; }
+  #status { margin-bottom: 10px; font-size: 14px; color: #333; }
+  canvas { width: 100% !important; max-width: 900px; height: 350px !important; }
+  button { padding: 10px 14px; background:#007bff; color:white; border:none; border-radius:8px; cursor:pointer; margin-right:10px; }
+</style>
+</head>
+<body>
 
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
-#include <Wire.h>
+<h2>Stable BLE Sensor Graph (No Infinite Scroll)</h2>
+<div id="status">Status: Idle</div>
 
-// Optional sensor libraries (uncomment if using them)
-// #include <Adafruit_MPU6050.h>
-// #include <Adafruit_Sensor.h>
-// #include <Adafruit_TCS34725.h>
+<button onclick="connectBLE()">Connect BLE</button>
 
-// If you have the Adafruit libs installed, uncomment the two lines below and the .begin() calls
-// Adafruit_MPU6050 mpu;
-// Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_2_4MS, TCS34725_GAIN_1X);
+<canvas id="chart"></canvas>
 
-#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define ACCEL_CHAR_UUID        "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define RGB_CHAR_UUID          "beb5483e-36e1-4688-b7f5-ea07361b26b0"
+<script>
+const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const ACCEL_UUID   = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+const RGB_UUID     = "beb5483e-36e1-4688-b7f5-ea07361b26b0";
 
-BLECharacteristic *pAccelCharacteristic;
-BLECharacteristic *pRGBCharacteristic;
-bool sensorsPresent = false;
+// ⚡ Keep ONLY latest 50 points — NO infinite graph
+const MAX_POINTS = 50;
 
-class MyServerCallbacks: public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) {
-    Serial.println("BLE Client Connected");
-  }
-  void onDisconnect(BLEServer* pServer) {
-    Serial.println("BLE Client Disconnected - restarting advertising");
-    // Restart advertising so browser/phone can reconnect
-    BLEDevice::startAdvertising();
-  }
-};
+let accelChar, rgbChar, lastA=null, lastR=null;
 
-String floatToStr(float v, int digits=2) {
-  char buf[24];
-  dtostrf(v, 0, digits, buf);
-  return String(buf);
+const ctx = document.getElementById("chart").getContext("2d");
+const chart = new Chart(ctx, {
+    type: "line",
+    data: {
+        labels: [],
+        datasets: [
+            { label:"Activity (g)", data:[], borderColor:"red", borderWidth:1 },
+            { label:"Brightness", data:[], borderColor:"blue", borderWidth:1 },
+            { label:"Blue Ratio", data:[], borderColor:"orange", borderWidth:1 }
+        ]
+    },
+    options: {
+        responsive:true,
+        maintainAspectRatio:false,
+        animation:false,
+        scales:{ x:{ ticks:{ maxTicksLimit:10 }} }
+    }
+});
+
+function updateStatus(t){ document.getElementById("status").innerText = "Status: "+t; }
+
+async function connectBLE(){
+    try{
+        updateStatus("Requesting device...");
+        let device = await navigator.bluetooth.requestDevice({
+            filters:[{ services:[SERVICE_UUID] }],
+            optionalServices:[SERVICE_UUID]
+        });
+        updateStatus("Connecting...");
+        let server = await device.gatt.connect();
+        let service = await server.getPrimaryService(SERVICE_UUID);
+
+        accelChar = await service.getCharacteristic(ACCEL_UUID);
+        rgbChar   = await service.getCharacteristic(RGB_UUID);
+
+        accelChar.startNotifications();
+        rgbChar.startNotifications();
+
+        accelChar.addEventListener("characteristicvaluechanged", e=>{
+            let txt = new TextDecoder().decode(e.target.value);
+            lastA = txt.split(",").map(Number);
+            pushData();
+        });
+
+        rgbChar.addEventListener("characteristicvaluechanged", e=>{
+            let txt = new TextDecoder().decode(e.target.value);
+            lastR = txt.split(",").map(Number);
+            pushData();
+        });
+
+        updateStatus("Connected");
+    }catch(e){
+        updateStatus("Error: "+e);
+    }
 }
 
-void setupSensors() {
-  sensorsPresent = false;
-  Wire.begin();
+function pushData(){
+    if(!lastA || !lastR) return;
 
-  // Try MPU6050
-  bool okMPU = false;
-  // Uncomment if using Adafruit MPU library:
-  /*
-  if (mpu.begin()) {
-    Serial.println("MPU6050 found");
-    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    okMPU = true;
-  } else {
-    Serial.println("MPU6050 not found");
-  }
-  */
+    let ax=lastA[0], ay=lastA[1], az=lastA[2];
+    let activity = Math.sqrt(ax*ax+ay*ay+az*az);
 
-  // Try TCS34725
-  bool okTCS = false;
-  // Uncomment if using Adafruit TCS library:
-  /*
-  if (tcs.begin()) {
-    Serial.println("TCS34725 found");
-    okTCS = true;
-  } else {
-    Serial.println("TCS34725 not found");
-  }
-  */
+    let r=lastR[0], g=lastR[1], b=lastR[2], c=lastR[3];
+    let blueRatio = c>0 ? b/c : 0;
 
-  // If both sensors are present set true. For demo purpose we'll allow either.
-  sensorsPresent = (okMPU || okTCS);
-  if (sensorsPresent) Serial.println("At least one sensor detected, running live mode.");
-  else Serial.println("No sensors detected - running demo broadcast mode.");
+    let time = new Date().toLocaleTimeString();
+
+    // 🔥 Keep graph ALWAYS at 50 points
+    if(chart.data.labels.length >= MAX_POINTS){
+        chart.data.labels.shift();
+        chart.data.datasets.forEach(ds => ds.data.shift());
+    }
+
+    chart.data.labels.push(time);
+    chart.data.datasets[0].data.push(activity);
+    chart.data.datasets[1].data.push(c);
+    chart.data.datasets[2].data.push(blueRatio);
+
+    chart.update();
+
+    // reset pairing
+    lastA=null; lastR=null;
 }
+</script>
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println();
-  Serial.println("ESP32 BLE Circadian Sensor - Booting");
-
-  // Initialize sensors (non-fatal)
-  setupSensors();
-
-  // BLE setup
-  BLEDevice::init("ESP32_Sensor_Hub"); // device name shown in scans
-  BLEServer *pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-
-  BLEService *pService = pServer->createService(*
+</body>
+</html>
